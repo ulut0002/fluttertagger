@@ -89,6 +89,8 @@ class FlutterTagger extends StatefulWidget {
     this.triggerCharactersRegex,
     this.tagTextFormatter,
     this.animationController,
+    this.rawTagPattern,
+    this.pasteThreshold,
   })  : assert(
           triggerCharacterAndStyles != const {},
           "triggerCharacterAndStyles cannot be empty",
@@ -160,6 +162,9 @@ class FlutterTagger extends StatefulWidget {
   /// {@macro triggerStrategy}
   final TriggerStrategy triggerStrategy;
 
+  final RegExp? rawTagPattern;
+  final int? pasteThreshold;
+
   @override
   State<FlutterTagger> createState() => _FlutterTaggerState();
 }
@@ -174,6 +179,13 @@ class _FlutterTaggerState extends State<FlutterTagger> {
   late bool _hideOverlay = true;
 
   final OverlayPortalController _overlayController = OverlayPortalController();
+
+  bool _handlingPaste = false;
+  bool _skipNextRecompute = false;
+
+  RegExp get _rawTagPattern =>
+      widget.rawTagPattern ?? RegExp(r'([@#!])([^#\s]+)#(.+?)#');
+  int get _pasteThreshold => widget.pasteThreshold ?? 1;
 
   /// Formats tag text to include id
   String _formatTagText(String id, String tag, String triggerCharacter) {
@@ -637,6 +649,106 @@ class _FlutterTaggerState extends State<FlutterTagger> {
     return false;
   }
 
+  bool _isLargeInsertion(String oldText, String newText) {
+    return (newText.length - oldText.length) > _pasteThreshold;
+  }
+
+  void _handlePasteRebuild() {
+    if (_handlingPaste) return;
+
+    _handlingPaste = true;
+    _defer = true;
+
+    final desiredCursor = controller.selection.baseOffset;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        final raw = _formattedText;
+
+        _tags.clear();
+        _tagTrie.clear();
+        _selectedTag = null;
+
+        final buffer = StringBuffer();
+        int currentIndex = 0;
+        int runningOffset = 0;
+
+        for (final match in _rawTagPattern.allMatches(raw)) {
+          if (match.groupCount < 3) continue;
+          // append normal text before tag
+          if (match.start > currentIndex) {
+            final normal = raw.substring(currentIndex, match.start);
+            buffer.write(normal);
+            runningOffset += normal.length;
+          }
+
+          final trigger = match.group(1)!;
+          final id = match.group(2)!.trim();
+          final name = match.group(3)!.trim();
+
+          final visible = "$trigger$name";
+          if (visible.isEmpty) continue;
+          if (runningOffset < 0) continue;
+          buffer.write(visible);
+
+          final taggedText = TaggedText(
+            startIndex: runningOffset,
+            endIndex: runningOffset + visible.length,
+            text: visible,
+          );
+
+          _tags[taggedText] = id;
+          _tagTrie.insert(taggedText);
+
+          runningOffset += visible.length;
+          currentIndex = match.end;
+        }
+
+        // append remaining tail
+        if (currentIndex < raw.length) {
+          final tail = raw.substring(currentIndex);
+          buffer.write(tail);
+        }
+
+        final rebuiltText = buffer.toString();
+
+        final newCursor = desiredCursor.clamp(0, rebuiltText.length);
+
+        controller.value = controller.value.copyWith(
+          text: rebuiltText,
+          selection: TextSelection.collapsed(offset: newCursor),
+          composing: TextRange.empty,
+        );
+
+        // reset state
+        _selectedTag = null;
+        _isTagSelected = false;
+        _startOffset = null;
+        _endOffset = null;
+
+        _shouldSearch = false;
+        _isBacktrackingToSearch = false;
+        _currentTriggerChar = "";
+
+        _lastCachedText = controller.text;
+        _lastCursorPosition = controller.selection.baseOffset;
+        _skipNextRecompute = true;
+        _onFormattedTextChanged();
+        // controller.notifyListeners();
+      } catch (e, s) {
+        debugPrint("Paste rebuild failed: $e");
+        debugPrint("$s");
+
+        // hard reset to keep widget usable
+        _tags.clear();
+        _tagTrie.clear();
+      } finally {
+        _defer = false;
+        _handlingPaste = false;
+      }
+    });
+  }
+
   /// Listener attached to [controller] to listen for change in
   /// search context and tag selection.
   ///
@@ -647,8 +759,14 @@ class _FlutterTaggerState extends State<FlutterTagger> {
   /// Exits search context and hides overlay when a terminating character
   /// not matched by [_searchRegexPattern] is entered.
   void _tagListener() {
+    if (_handlingPaste) return;
     final currentCursorPosition = controller.selection.baseOffset;
     final text = controller.text;
+
+    if (_lastCachedText != text && _isLargeInsertion(_lastCachedText, text)) {
+      _handlePasteRebuild();
+      return;
+    }
 
     if (_shouldSearch &&
         _isBacktrackingToSearch &&
@@ -771,6 +889,10 @@ class _FlutterTaggerState extends State<FlutterTagger> {
 
   /// Recomputes affected tag positions when text value is modified.
   void _recomputeTags(String oldCachedText, String currentText, int position) {
+    if (_skipNextRecompute) {
+      _skipNextRecompute = false;
+      return;
+    }
     final currentCursorPosition = controller.selection.baseOffset;
     if (currentCursorPosition != currentText.length) {
       Map<TaggedText, String> newTable = {};
@@ -1201,34 +1323,28 @@ class FlutterTaggerController extends TextEditingController {
   TextSpan _buildTextSpan(TextStyle? style) {
     if (text.isEmpty) return const TextSpan();
 
-    final splitText = text.split(" ");
+    final spans = <TextSpan>[];
+    final parts = text.split(' ');
 
-    List<TextSpan> spans = [];
     int start = 0;
-    int end = splitText.first.length;
 
-    for (int i = 0; i < splitText.length; i++) {
-      final currentText = splitText[i];
+    for (int i = 0; i < parts.length; i++) {
+      final part = parts[i];
 
-      if (currentText.contains(_triggerCharactersPattern)) {
-        final nestedSpans = _getNestedSpans(currentText, start);
-        spans.addAll(nestedSpans);
-        if (i < splitText.length - 1 && splitText[i + 1].isNotEmpty) {
-          spans.add(const TextSpan(text: " "));
-        }
-
-        start = end + 1;
-        if (i + 1 < splitText.length) {
-          end = start + splitText[i + 1].length;
-        }
+      if (part.contains(_triggerCharactersPattern)) {
+        spans.addAll(_getNestedSpans(part, start));
       } else {
-        start = end + 1;
-        if (i + 1 < splitText.length) {
-          end = start + splitText[i + 1].length;
-        }
-        spans.add(TextSpan(text: "$currentText "));
+        spans.add(TextSpan(text: part, style: style));
+      }
+
+      if (i < parts.length - 1) {
+        spans.add(TextSpan(text: ' ', style: style));
+        start += part.length + 1;
+      } else {
+        start += part.length;
       }
     }
+
     return TextSpan(children: spans, style: style);
   }
 
